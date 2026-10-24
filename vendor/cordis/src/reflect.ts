@@ -3,6 +3,7 @@ import type { Dict } from '@deepseek-ai/cosmokit'
 import { Context } from './context.ts'
 import { getTraceable, symbols, withProps } from './utils.ts'
 import { Fiber, FiberState } from './fiber.ts'
+import { unloadingCompletion, unloadingFibers } from './unloading.ts'
 
 declare module './context.ts' {
   interface Context {
@@ -297,7 +298,7 @@ export class ReflectService {
       return async () => {
         delete this.store[key]
         const fibers = this.notify([name])
-        await Promise.allSettled(fibers.map(fiber => fiber.await()))
+        await Promise.allSettled(fibers.map(fiber => unloadingCompletion(fiber) ?? fiber.await()))
         // ensure self access before dependencies cleanup
         delete this.ctx.fiber.store![name]
       }
@@ -324,6 +325,11 @@ export class ReflectService {
         }
         if (!hasUpdate) continue
         fiber._refresh()
+        fibers.push(fiber)
+      }
+    }
+    for (const fiber of unloadingFibers(this.ctx)) {
+      if (!fibers.includes(fiber) && names.some(name => name in fiber.inject && filter(fiber.ctx, name))) {
         fibers.push(fiber)
       }
     }

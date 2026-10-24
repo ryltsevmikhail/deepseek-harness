@@ -88,6 +88,36 @@ it.each(['v1', 'v2'] as const)('replaces a %s module and retains the latest Load
   expect(mounted.at(-1)).toBe('after:next')
 })
 
+it('does not reload an explicitly stopped plugin while its cleanup is pending', async () => {
+  const { ctx, module, imports, reload } = await fixture()
+  const entered = Promise.withResolvers<undefined>()
+  const finish = Promise.withResolvers<undefined>()
+  let replacements = 0
+  const before = { apply(inner: Context) {
+    inner.effect(() => async () => { entered.resolve(undefined); await finish.promise })
+  } }
+  const after = { apply() { replacements += 1 } }
+  const job = module('stopping.mjs', before)
+  const entry = ctx.loader.resolve(await ctx.loader.create({ name: job.url }))
+  await ctx.loader.await()
+  const fiber = entry.fiber
+  if (fiber === undefined) throw new Error('plugin not mounted')
+  const disposed = fiber.dispose()
+  try {
+    await entered.promise
+    imports.set(job.url, after)
+    reload.stashed.add(job.url)
+    const replacing = reload.partialReload()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    finish.resolve(undefined)
+    await Promise.all([disposed, replacing])
+    expect(replacements).toBe(0)
+  } finally {
+    finish.resolve(undefined)
+    await disposed
+  }
+})
+
 it('replaces volatile references on code HMR after an in-place config update', async () => {
   const { ctx, module, imports, reload } = await fixture()
   const Config = z.object({ value: z.string().volatile() })

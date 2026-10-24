@@ -1,0 +1,132 @@
+name: SDK compatibility lifecycle
+
+on:
+  pull_request:
+    branches: ['compat/v0.2.0-rc.2']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  consumers:
+    name: Lifecycle / ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            node: '22.19'
+          - os: ubuntu-24.04
+            node: '24'
+          - os: ubuntu-24.04
+            node: '26'
+          - os: windows-2025
+            node: '24'
+          - os: macos-15
+            node: '24'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - name: Isolate Harness storage on POSIX
+        if: runner.os != 'Windows'
+        run: |
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-compat" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Isolate Harness storage on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "DSH_HOME=$env:RUNNER_TEMP/dsh-compat" >> $env:GITHUB_ENV
+          "TMPDIR=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+      - name: Install immutable dependencies without lifecycle hooks
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify complete Cordis and HMR consumer suites
+        run: pnpm exec vitest run packages/boot/app-boot packages/boot/hmr packages/extensions/tool-cordis
+      - name: Check Cordis declarations
+        run: pnpm exec tsc -b vendor/cordis/tsconfig.json --pretty false
+
+  static:
+    name: Host build and documentation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Isolate Harness storage
+        run: |
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-compat" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install immutable dependencies without lifecycle hooks
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build host contracts and bundles
+        run: pnpm run build:lib:host
+      - name: Verify complete documentation gates
+        run: pnpm run doc-sync
+      - name: Lint changed lifecycle implementation and regressions
+        run: pnpm exec tsx scripts/run-oxlint.ts vendor/cordis/src/fiber.ts vendor/cordis/src/reflect.ts vendor/cordis/src/unloading.ts packages/extensions/tool-cordis/tests/cordis-lifecycle.spec.ts packages/boot/hmr/tests/modules.spec.ts
+
+  coverage:
+    name: Exhaustive Linux coverage
+    runs-on: ubuntu-24.04
+    env:
+      DSH_GATE_CONCURRENCY: '2'
+      DSH_COVERAGE_MAX_WORKERS: '2'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Isolate Harness storage
+        run: |
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-compat" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install immutable dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Prepare CI sandbox
+        run: bash scripts/prepare-ci-bubblewrap.sh
+      - name: Run repository exhaustive coverage gate
+        run: pnpm run check:ci:coverage
+
+  complete:
+    name: Compatibility checks passed
+    if: always()
+    needs: [consumers, static, coverage]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every compatibility check
+        env:
+          CONSUMERS: ${{ needs.consumers.result }}
+          STATIC: ${{ needs.static.result }}
+          COVERAGE: ${{ needs.coverage.result }}
+        run: test "$CONSUMERS" = success && test "$STATIC" = success && test "$COVERAGE" = success

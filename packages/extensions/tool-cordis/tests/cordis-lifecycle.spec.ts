@@ -6,6 +6,211 @@ import { describe, expect, it } from 'vitest'
  * cordis-host-runner and cordis-client-runner and every other harness plugin.
  */
 
+describe('Cordis consumer quiescence', () => {
+  for (const teardown of ['root', 'provider', 'delete'] as const) {
+    it(`keeps provider resources until already-unloading consumers stop during ${teardown} disposal`, async () => {
+      const ctx = new Context()
+      const started = Promise.withResolvers<undefined>()
+      const finish = Promise.withResolvers<undefined>()
+      const events: string[] = []
+      let providerClosed = false
+      const provider = (inner: Context) => {
+        inner.effect(function* () {
+          yield () => { providerClosed = true; events.push('provider closed') }
+          yield inner.provide('quiescenceProvider', {})
+        })
+      }
+      const consumer = Object.assign((inner: Context) => {
+        inner.effect(() => async () => {
+          started.resolve(undefined)
+          await finish.promise
+          events.push('consumer stopped')
+        })
+      }, { inject: ['quiescenceProvider'] })
+      const providerFiber = await ctx.plugin(provider)
+      const consumerFiber = await ctx.plugin(consumer)
+      let closedEarly = true
+      let exposedWhileStopping = true
+      try {
+        if (teardown === 'delete') ctx.registry.delete(consumer)
+        const disposing = teardown === 'root'
+          ? [ctx.fiber.dispose()]
+          : [teardown === 'delete' ? consumerFiber.await() : consumerFiber.dispose(), providerFiber.dispose()]
+        await started.promise
+        await new Promise<void>(resolve => setImmediate(resolve))
+        closedEarly = providerClosed
+        exposedWhileStopping = [...(ctx.registry.get(consumer)?.fibers ?? [])].some(fiber => fiber.uid === null)
+        finish.resolve(undefined)
+        await Promise.all(disposing)
+      } finally {
+        finish.resolve(undefined)
+        await ctx.fiber.dispose()
+      }
+      expect(closedEarly).toBe(false)
+      expect(exposedWhileStopping).toBe(false)
+      expect(events).toEqual(['consumer stopped', 'provider closed'])
+    })
+  }
+  it('joins a consumer when a disposal observer synchronously withdraws its provider', async () => {
+    const ctx = new Context()
+    const started = Promise.withResolvers<undefined>()
+    const finish = Promise.withResolvers<undefined>()
+    let closed = false
+    let stopProvided!: () => Promise<void>
+    await ctx.plugin((inner: Context) => {
+      stopProvided = inner.effect(function* () {
+        yield () => { closed = true }
+        yield inner.provide('reentrantProvider', {})
+      })
+    })
+    const consumer = await ctx.plugin(Object.assign((inner: Context) => {
+      inner.effect(() => async () => { started.resolve(undefined); await finish.promise })
+    }, { inject: ['reentrantProvider'] }))
+    let withdrawn = Promise.resolve()
+    ctx.on('internal/plugin', (fiber) => {
+      if (fiber === consumer.ctx.fiber && fiber.uid === null) withdrawn = Promise.resolve(stopProvided())
+    })
+    const disposed = consumer.dispose()
+    let closedEarly = true
+    try {
+      await started.promise
+      await new Promise<void>(resolve => setImmediate(resolve))
+      closedEarly = closed
+      finish.resolve(undefined)
+      await Promise.all([disposed, withdrawn])
+    } finally {
+      finish.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+    expect(closedEarly).toBe(false)
+    expect(closed).toBe(true)
+  })
+
+  it('does not retain a stopped runtime when a status observer throws during unload', async () => {
+    const ctx = new Context()
+    const started = Promise.withResolvers<undefined>()
+    const finish = Promise.withResolvers<undefined>()
+    const provider = await ctx.plugin((inner: Context) => inner.provide('statusProvider', {}))
+    const plugin = Object.assign((inner: Context) => inner.effect(() => async () => {
+      started.resolve(undefined)
+      await finish.promise
+    }), { inject: ['statusProvider'] })
+    const target = await ctx.plugin(plugin)
+    ctx.on('internal/status', (fiber) => {
+      if (fiber === target.ctx.fiber && fiber.state === FiberState.UNLOADING) throw new Error('broken status observer')
+    })
+    const disposed = target.dispose().catch((error: unknown) => error)
+    try {
+      await started.promise
+      finish.resolve(undefined)
+      const error = await disposed
+      await target.await()
+      expect(error).toEqual(expect.objectContaining({ message: 'broken status observer' }))
+      expect(ctx.registry.has(plugin)).toBe(false)
+      await provider.dispose()
+    } finally {
+      finish.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('joins newer cleanup after an older loading transition rejects', async () => {
+    const ctx = new Context()
+    const starting = Promise.withResolvers<undefined>()
+    const start = Promise.withResolvers<undefined>()
+    const cleaning = Promise.withResolvers<undefined>()
+    const finish = Promise.withResolvers<undefined>()
+    let closed = false
+    const provider = await ctx.plugin((inner: Context) => inner.effect(function* () {
+      yield () => { closed = true }
+      yield inner.provide('loadingProvider', {})
+    }))
+    const consumer = ctx.plugin(Object.assign(async (inner: Context) => {
+      inner.effect(() => async () => { cleaning.resolve(undefined); await finish.promise })
+      starting.resolve(undefined)
+      await start.promise
+    }, { inject: ['loadingProvider'] }))
+    const loaded = Promise.resolve(consumer).catch((error: unknown) => error)
+    await starting.promise
+    ctx.on('internal/status', (fiber) => {
+      if (fiber === consumer.ctx.fiber && fiber.state === FiberState.UNLOADING) throw new Error('broken loading observer')
+    })
+    const disposed = consumer.dispose().catch((error: unknown) => error)
+    const withdrawing = provider.dispose()
+    let closedEarly = true
+    try {
+      start.resolve(undefined)
+      await cleaning.promise
+      await new Promise<void>(resolve => setImmediate(resolve))
+      closedEarly = closed
+      finish.resolve(undefined)
+      const error = await disposed
+      await consumer.ctx.fiber.await()
+      await loaded
+      await withdrawing
+      expect(error).toEqual(expect.objectContaining({ message: 'broken loading observer' }))
+    } finally {
+      start.resolve(undefined)
+      finish.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+    expect(closedEarly).toBe(false)
+  })
+
+  it('preserves a new runtime registered by an old runtime disposal observer', async () => {
+    const ctx = new Context()
+    const finish = Promise.withResolvers<undefined>()
+    const plugin = (inner: Context) => inner.effect(() => async () => { await finish.promise })
+    const old = await ctx.plugin(plugin)
+    let replacement: ReturnType<Context['plugin']> | undefined
+    ctx.on('internal/plugin', (fiber) => {
+      if (fiber === old.ctx.fiber && fiber.uid === null) {
+        ctx.registry.delete(plugin)
+        replacement = ctx.plugin(plugin)
+      }
+    })
+    const stopped = old.dispose()
+    try {
+      if (replacement === undefined) throw new Error('replacement was not registered')
+      const next = await replacement
+      finish.resolve(undefined)
+      await stopped
+      expect(ctx.registry.get(plugin)).toBe(next.runtime)
+      expect(next.uid).not.toBeNull()
+    } finally {
+      finish.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not reactivate a stopping consumer when its provider is replaced', async () => {
+    const ctx = new Context()
+    const started = Promise.withResolvers<undefined>()
+    const finish = Promise.withResolvers<undefined>()
+    let starts = 0
+    let stops = 0
+    const provider = await ctx.plugin((inner: Context) => inner.provide('replacementProvider', {}))
+    const consumer = await ctx.plugin(Object.assign((inner: Context) => {
+      starts += 1
+      inner.effect(() => async () => { started.resolve(undefined); await finish.promise; stops += 1 })
+    }, { inject: ['replacementProvider'] }))
+    try {
+      const stopped = consumer.dispose()
+      await started.promise
+      const withdrawn = provider.dispose()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      await ctx.plugin((inner: Context) => inner.provide('replacementProvider', {}))
+      finish.resolve(undefined)
+      await Promise.all([stopped, withdrawn])
+      expect(starts).toBe(1)
+      expect(stops).toBe(1)
+    } finally {
+      finish.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
 describe('Cordis effect ownership', () => {
   it('makes an effect visible to a reentrant owner restart and awaits setup plus cleanup', async () => {
     const ctx = new Context()
