@@ -32,6 +32,8 @@ env:
 
 jobs:
   preview:
+    # Compatibility forks verify sources without deploying an upstream preview.
+    if: github.repository == 'deepseek-ai/deepseek-harness' || github.repository == 'deepseek-harness/deepseek-harness'
     runs-on: ubuntu-24.04
     name: cloudflare pages preview
     steps:

@@ -5,6 +5,7 @@ import type { Plugin } from './registry.ts'
 import { buildOuterStack, composeError, DisposableList, getTraceable, isConstructor, isObject, symbols } from './utils.ts'
 import type { Impl } from './reflect.ts'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
+import { trackUnloading } from './unloading.ts'
 
 declare module './context.ts' {
   export interface Context extends Pick<Fiber, 'effect'> {
@@ -265,33 +266,39 @@ export class Fiber {
       this.dispose = parent.fiber.effect(() => {
         const remove = runtime.fibers.push(this)
         return async () => {
+          const release = trackUnloading(this)
           this.uid = null
-          emitPluginDisposed(this.context, this)
-          if (this.ctx.registry.has(runtime.callback)) {
+          try {
+            emitPluginDisposed(this.context, this)
             remove()
-            if (!runtime.fibers.length) {
+            if (!runtime.fibers.length && this.ctx.registry.get(runtime.callback) === runtime) {
               this.ctx.registry.delete(runtime.callback)
             }
-          }
-          this._setEpoch(INACTIVE)
-          // A PENDING fiber can already own effects registered by an
-          // internal/plugin observer. Its epoch is still INACTIVE, so
-          // _setEpoch() has no transition to drive; explicitly unload that
-          // pre-activation work before reporting disposal complete.
-          if (!this.inertia) {
-            this._updateState(() => {
-              this.inertia = this._unload()
-              return FiberState.UNLOADING
-            })
-          }
-          // `this.inertia` itself should never reject — both `_reload` and
-          // `_unload` swallow their own work errors via `ctx.logger.error`.
-          // If it *does* reject, the only remaining cause is the logger
-          // itself failing, which we can't recover from in this exact spot
-          // (calling the logger again is what just failed). Let the
-          // rejection propagate; process-level crash is the honest outcome.
-          while (this.inertia) {
-            await this.inertia
+            this._setEpoch(INACTIVE)
+            // PENDING fibers may already own effects from publication observers.
+            if (!this.inertia) {
+              this._updateState(() => {
+                this.inertia = this._unload()
+                return FiberState.UNLOADING
+              })
+            }
+          } finally {
+            try {
+              // A rejected transition may already have started newer cleanup.
+              let failure: { reason: unknown } | undefined
+              while (this.inertia) {
+                const task = this.inertia
+                try {
+                  await task
+                } catch (reason) {
+                  failure ??= { reason }
+                  if (this.inertia === task) break
+                }
+              }
+              if (failure !== undefined) throw failure.reason
+            } finally {
+              release()
+            }
           }
         }
       }, 'ctx.plugin()')
@@ -609,6 +616,7 @@ export class Fiber {
   }
 
   _refresh() {
+    if (this.uid === null) return
     let epoch: string | boolean = false
     epoch = ''
     for (const name of Object.keys(this.inject)) {

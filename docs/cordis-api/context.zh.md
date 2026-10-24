@@ -258,7 +258,7 @@ get(name: string, strict?: boolean): any
 
 **返回**服务值；如果尚未提供，则返回 `undefined`。
 
-[源码](../../vendor/cordis/src/reflect.ts#L17)
+[源码](../../vendor/cordis/src/reflect.ts#L18)
 
 ### ctx.set(name, value)
 
@@ -283,7 +283,7 @@ set(name: string, value: any): void
 - `name`：服务名称。
 - `value`：新的服务值。
 
-[源码](../../vendor/cordis/src/reflect.ts#L29)
+[源码](../../vendor/cordis/src/reflect.ts#L30)
 
 ### ctx.provide(name, value)
 
@@ -313,7 +313,7 @@ fiber 激活后，该服务对同一隔离作用域内的依赖方可见；当�
 
 **返回**一个用于取消注册该服务的资源释放函数。
 
-[源码](../../vendor/cordis/src/reflect.ts#L44)
+[源码](../../vendor/cordis/src/reflect.ts#L45)
 
 ### ctx.accessor(name, options)
 
@@ -337,7 +337,7 @@ accessor(name: string, options: Omit<Property.Accessor, 'type'>): void
 - `name`：上下文属性名称。
 - `options`：`get` 钩子和可选的 `set` 钩子。
 
-[源码](../../vendor/cordis/src/reflect.ts#L56)
+[源码](../../vendor/cordis/src/reflect.ts#L57)
 
 ### ctx.mixin(name, mixins)
 
@@ -363,4 +363,4 @@ mixin<T extends {}>(source: T, mixins: (keyof this & keyof T)[] | Dict<string>):
 - `name`：存放源服务的上下文属性。
 - `mixins`：要转发的键，或从源键到 ctx 键的映射。
 
-[源码](../../vendor/cordis/src/reflect.ts#L67)
+[源码](../../vendor/cordis/src/reflect.ts#L68)
