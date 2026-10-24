@@ -417,7 +417,6 @@ export class SessionProjectionCache extends Service {
 
   private put(id: SessionId, identity: CurrentCheckpointIdentity, rows: ProjectionCheckpoint, owner?: Session): Promise<void> {
     try {
-      if (!this.acceptingWrites) throw new Error('session projection cache is closed')
       const detached = snapshotJsonValue(rows)
       if (detached === undefined) {
         throw new TypeError('projection checkpoint is not losslessly JSON-serializable (a unit state violates the plain-JSON contract)')
@@ -465,7 +464,7 @@ export class SessionProjectionCache extends Service {
       if (next === undefined) break
       state.active = next
     }
-    if (this.writes.get(id) === state) this.writes.delete(id)
+    this.writes.delete(id)
     state.drained.resolve(undefined)
   }
 
