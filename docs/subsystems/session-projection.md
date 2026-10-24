@@ -170,22 +170,23 @@ cachedPredecessorTitle(meta: SessionHeader): ProjectionSnapshot | undefined
 hydratePrepared( session: Session, events: readonly SessionEvent[], ): ProjectionSnapshot
 
 /**
- * Durably checkpoint one live session NOW (all mandatory points call
- * this; tests and carriers may too). The registry cut is snapshotted at
- * this boundary (states are live references), then the session's record is
- * replaced on the domain's write chain. NOT fail-soft — callers on the
- * fail-soft paths contain it.
- * @param session - the live session to checkpoint.
+ * Capture one session checkpoint now and resolve after a covering cut is durable.
+ * Pending requests for the same exact Session share the latest detached cut;
+ * distinct Session lifecycles never share a completion. A retired Session cannot
+ * overwrite a replacement currently owning its id. NOT fail-soft — background
+ * callers contain failures.
+ * @param session - the exact Session whose captured cut is requested.
  * @returns resolution after durability and event emission.
  */
-async write(session: Session): Promise<void>
+write(session: Session): Promise<void>
 
 /**
  * Cold-read one session's projections from its complete log. Each unit is
  * seeded from the identity-checked cached rows — the registry skips `apply`
  * for the already-folded prefix (events at or below the row's `seq`) — and
- * the refreshed checkpoint is written back (fail-soft, fire-and-forget), so
- * the first cold read creates the cache row and later ones seed from it.
+ * the refreshed checkpoint is optionally written back (fail-soft, fire-and-forget).
+ * Live owners and accepted hot writes suppress this optional refresh. Cold-only
+ * requests retain at most one active and one latest pending cut per id.
  * The caller supplies the complete log in seq order: this service never
  * consults the persistence layer.
  * @param meta - the stored session header (identity witness).

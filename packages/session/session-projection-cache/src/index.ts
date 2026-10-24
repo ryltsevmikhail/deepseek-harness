@@ -86,10 +86,25 @@ export const Config: z<Config> = z.object({
 
 /** Per-session write-behind bookkeeping (live sessions only; dropped at retire). */
 interface DirtyState {
-  /** Committed events since the last durable write. */
+  /** Committed events since the latest checkpoint request. */
   pending: number
   /** Interval trigger armed at the first dirty event after a clean write. */
   timer: ReturnType<typeof setTimeout> | undefined
+}
+
+interface CheckpointWrite {
+  identity: CurrentCheckpointIdentity
+  rows: CheckpointRecord['rows']
+  /** Exact hot lifecycle; undefined denotes an optional cold write-back. */
+  owner: Session | undefined
+  barrier: (() => Promise<void>) | undefined
+  completion: PromiseWithResolvers<undefined>
+}
+
+interface CheckpointWrites {
+  active: CheckpointWrite
+  pending: CheckpointWrite[]
+  drained: PromiseWithResolvers<undefined>
 }
 
 /**
@@ -108,6 +123,9 @@ export class SessionProjectionCache extends Service {
 
   private table?: KvTable<SessionId, CheckpointRecord>
   private readonly dirty = new Map<Session, DirtyState>()
+  private readonly writes = new Map<SessionId, CheckpointWrites>()
+  private acceptingWrites = true
+  private readonly observedWrites = new WeakSet<Promise<void>>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'sessionProjectionCache')
@@ -116,7 +134,10 @@ export class SessionProjectionCache extends Service {
   /** Open the domain and install the write-behind listeners. */
   protected async [Service.init](): Promise<void> {
     const domain = await this.ctx.storageDomain.open(projectionCacheDomainSpec)
-    this.ctx.effect(() => () => domain.close(), 'sessionProjectionCache.domainClose')
+    this.ctx.effect(() => async () => {
+      await this.closeWrites()
+      await domain.close()
+    }, 'sessionProjectionCache.domainClose')
     this.table = domain.table('sessions')
     this.installWritePath()
   }
@@ -245,38 +266,35 @@ export class SessionProjectionCache extends Service {
   }
 
   /**
-   * Durably checkpoint one live session NOW (all mandatory points call
-   * this; tests and carriers may too). The registry cut is snapshotted at
-   * this boundary (states are live references), then the session's record is
-   * replaced on the domain's write chain. NOT fail-soft — callers on the
-   * fail-soft paths contain it.
-   * @param session - the live session to checkpoint.
+   * Capture one session checkpoint now and resolve after a covering cut is durable.
+   * Pending requests for the same exact Session share the latest detached cut;
+   * distinct Session lifecycles never share a completion. A retired Session cannot
+   * overwrite a replacement currently owning its id. NOT fail-soft — background
+   * callers contain failures.
+   * @param session - the exact Session whose captured cut is requested.
    * @returns resolution after durability and event emission.
    */
-  async write(session: Session): Promise<void> {
-    const rows = this.ctx.sessionProjections.checkpoint(session)
-    this.markClean(session)
-    // Durability barrier: the checkpoint cut was taken above, so flushing
-    // AFTER it guarantees every event inside the cut is durably logged
-    // before the cache row lands — a crash can leave the cache behind the
-    // log (longer tail replay) but never ahead of it (phantom values folded
-    // from events no stored log contains). At detach the store entry is
-    // already gone; persistence's own retirement drain covers that path and
-    // any residual overreach is caught by the cold read's anchored floor.
-    if (this.ctx.sessions.get(session.id) === session) await this.ctx.sessions.flush(session)
-    await this.put(
-      session.id,
-      identityOf(session.header, session.inheritedEventCount),
-      rows,
-    )
+  write(session: Session): Promise<void> {
+    try {
+      if (!this.acceptingWrites) throw new Error('session projection cache is closed')
+      const current = this.ctx.sessions.get(session.id)
+      if (current !== undefined && current !== session) throw new Error(`session "${session.id}" is no longer current`)
+      const rows = this.ctx.sessionProjections.checkpoint(session)
+      this.markClean(session)
+      return this.put(session.id, identityOf(session.header, session.inheritedEventCount), rows, session)
+    } catch (error) {
+      // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- Preserve original rejected values.
+      return Promise.reject(error)
+    }
   }
 
   /**
    * Cold-read one session's projections from its complete log. Each unit is
    * seeded from the identity-checked cached rows — the registry skips `apply`
    * for the already-folded prefix (events at or below the row's `seq`) — and
-   * the refreshed checkpoint is written back (fail-soft, fire-and-forget), so
-   * the first cold read creates the cache row and later ones seed from it.
+   * the refreshed checkpoint is optionally written back (fail-soft, fire-and-forget).
+   * Live owners and accepted hot writes suppress this optional refresh. Cold-only
+   * requests retain at most one active and one latest pending cut per id.
    * The caller supplies the complete log in seq order: this service never
    * consults the persistence layer.
    * @param meta - the stored session header (identity witness).
@@ -297,11 +315,13 @@ export class SessionProjectionCache extends Service {
       meta,
       inheritedEventCount,
     )
-    // Refresh the row so the next cold read seeds from it; fail-soft and
-    // fire-and-forget — a failed write-back only costs a longer tail replay.
-    void this.put(meta.id, identity, restored.checkpoint).catch((error: unknown) => {
-      this.ctx.logger.warn(`session projection cache: cold-read write-back for "${meta.id}" failed (cache stays stale): ${String(error)}`)
-    })
+    const writing = this.writes.get(meta.id)
+    const hotPending = writing !== undefined
+      && (writing.active.owner !== undefined || writing.pending.some(write => write.owner !== undefined))
+    // Optional cold refreshes cannot supersede a live owner's accepted cut.
+    if (this.acceptingWrites && this.ctx.sessions.get(meta.id) === undefined && !hotPending) {
+      this.observeWrite(this.put(meta.id, identity, restored.checkpoint), `cold-read write-back for "${meta.id}"`)
+    }
     return restored.snapshot
   }
 
@@ -314,18 +334,18 @@ export class SessionProjectionCache extends Service {
     // one), count/interval throttle the in-turn stream.
     this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (event.type === 'turn/end') {
-        void this.flushSoft(session, 'turn/end')
+        this.flushSoft(session, 'turn/end')
         return
       }
       const state = this.dirty.get(session) ?? { pending: 0, timer: undefined }
       this.dirty.set(session, state)
       state.pending += 1
       if (state.pending >= this.config.writeEveryEvents) {
-        void this.flushSoft(session, 'count threshold')
+        this.flushSoft(session, 'count threshold')
         return
       }
       state.timer ??= setTimeout(() => {
-        void this.flushSoft(session, 'interval')
+        this.flushSoft(session, 'interval')
       }, this.config.writeIntervalMs)
     })
 
@@ -335,7 +355,7 @@ export class SessionProjectionCache extends Service {
     // the store, would leave the seed-derived values (the title) unreadable
     // on the cold list. The creation write captures the seed-derived cut.
     this.ctx.on('session/created', (session: Session) => {
-      void this.flushSoft(session, 'create')
+      this.flushSoft(session, 'create')
     })
 
     // Detach (the live-to-cold moment): the final mandatory point. After
@@ -343,22 +363,20 @@ export class SessionProjectionCache extends Service {
     // flushSoft's synchronous prefix reads and resets the dirty state, so
     // dropping it (timer already cleared by markClean) right after is safe.
     this.ctx.on('session/disposed', (session: Session) => {
-      void this.flushSoft(session, 'detach')
+      this.flushSoft(session, 'detach')
       this.markClean(session)
       this.dirty.delete(session)
     })
 
-    // With the plugin (their sessions outlive the cache): clear pending
-    // timers and stop accepting new work. The domain-close effect registered
-    // in init runs after this disposer and drains already-queued writes, so
-    // a late flush can never land after disposal (it rejects `closed` into
-    // flushSoft's warning instead).
-    this.ctx.effect(() => () => {
-      for (const state of this.dirty.values()) {
-        if (state.timer !== undefined) clearTimeout(state.timer)
-      }
-      this.dirty.clear()
-    }, 'sessionProjectionCache.timers')
+  }
+
+  private async closeWrites(): Promise<void> {
+    this.acceptingWrites = false
+    for (const state of this.dirty.values()) {
+      if (state.timer !== undefined) clearTimeout(state.timer)
+    }
+    this.dirty.clear()
+    await Promise.all([...this.writes.values()].map(state => state.drained.promise))
   }
 
   /**
@@ -366,12 +384,16 @@ export class SessionProjectionCache extends Service {
    * the throttle triggers only fire dirty (markClean clears the timer with
    * the counter) and the mandatory points write unconditionally.
    */
-  private async flushSoft(session: Session, trigger: string): Promise<void> {
-    try {
-      await this.write(session)
-    } catch (error) {
-      this.ctx.logger.warn(`session projection cache: ${trigger} write for "${session.id}" failed (cache stays stale): ${String(error)}`)
-    }
+  private flushSoft(session: Session, trigger: string): void {
+    this.observeWrite(this.write(session), `${trigger} write for "${session.id}"`)
+  }
+
+  private observeWrite(writing: Promise<void>, operation: string): void {
+    if (this.observedWrites.has(writing)) return
+    this.observedWrites.add(writing)
+    void writing.catch((error: unknown) => {
+      this.ctx.logger.warn(`session projection cache: ${operation} failed (cache stays stale): ${String(error)}`)
+    })
   }
 
   /** Reset one session's dirty bookkeeping (its checkpoint is being written). */
@@ -385,13 +407,66 @@ export class SessionProjectionCache extends Service {
     }
   }
 
-  /** Replace one session's stored record with its log identity and a detached snapshot of `rows`. */
-  private async put(id: SessionId, identity: CheckpointIdentity, rows: ProjectionCheckpoint): Promise<void> {
-    const detached = snapshotJsonValue(rows)
-    if (detached === undefined) {
-      throw new TypeError('projection checkpoint is not losslessly JSON-serializable (a unit state violates the plain-JSON contract)')
+  /** Capture the owning store before pending work can outlast service withdrawal. */
+  private logBarrier(session: Session): () => Promise<void> {
+    const sessions = this.ctx.sessions
+    return async () => {
+      if (sessions.get(session.id) === session) await sessions.flush(session)
     }
-    await this.requireTable().put(id, { identity, rows: detached as CheckpointRecord['rows'] })
+  }
+
+  private put(id: SessionId, identity: CurrentCheckpointIdentity, rows: ProjectionCheckpoint, owner?: Session): Promise<void> {
+    try {
+      if (!this.acceptingWrites) throw new Error('session projection cache is closed')
+      const detached = snapshotJsonValue(rows)
+      if (detached === undefined) {
+        throw new TypeError('projection checkpoint is not losslessly JSON-serializable (a unit state violates the plain-JSON contract)')
+      }
+      const value = detached as CheckpointRecord['rows']
+      const barrier = owner === undefined ? undefined : this.logBarrier(owner)
+      const state = this.writes.get(id)
+      if (state !== undefined) {
+        const pending = state.pending.find(write => write.owner === owner)
+        if (pending !== undefined) {
+          pending.identity = identity
+          pending.rows = value
+          pending.barrier = barrier
+          return pending.completion.promise
+        }
+        const write = { identity, rows: value, owner, barrier, completion: Promise.withResolvers<undefined>() }
+        // Finish an older lifecycle before admitting a newer lifecycle for this id.
+        if (owner !== undefined && state.active.owner === owner) state.pending.unshift(write)
+        else state.pending.push(write)
+        return write.completion.promise
+      }
+      const active = { identity, rows: value, owner, barrier, completion: Promise.withResolvers<undefined>() }
+      const writes = { active, pending: [], drained: Promise.withResolvers<undefined>() }
+      this.writes.set(id, writes)
+      void this.drainWrites(id, writes)
+      return active.completion.promise
+    } catch (error) {
+      // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- Preserve original rejected values.
+      return Promise.reject(error)
+    }
+  }
+
+  private async drainWrites(id: SessionId, state: CheckpointWrites): Promise<void> {
+    while (true) {
+      const write = state.active
+      try {
+        // Each captured cut needs its own log barrier, not the previous cut's flush.
+        if (write.barrier !== undefined) await write.barrier()
+        await this.requireTable().put(id, { identity: write.identity, rows: write.rows })
+        write.completion.resolve(undefined)
+      } catch (error) {
+        write.completion.reject(error)
+      }
+      const next = state.pending.shift()
+      if (next === undefined) break
+      state.active = next
+    }
+    if (this.writes.get(id) === state) this.writes.delete(id)
+    state.drained.resolve(undefined)
   }
 
   private requireTable(): KvTable<SessionId, CheckpointRecord> {

@@ -57,10 +57,16 @@ jobs:
           "TMPDIR=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
       - name: Install immutable dependencies without lifecycle hooks
         run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Verify complete Cordis and HMR consumer suites
-        run: pnpm exec vitest run packages/boot/app-boot packages/boot/hmr packages/extensions/tool-cordis
-      - name: Check Cordis declarations
-        run: pnpm exec tsc -b vendor/cordis/tsconfig.json --pretty false
+      - name: Verify lifecycle and checkpoint storage consumers
+        run: >-
+          pnpm exec vitest run
+          packages/boot/app-boot packages/boot/hmr packages/extensions/tool-cordis
+          packages/session/session-projection-cache
+          packages/storage/storage-domain packages/storage/storage-json packages/storage/storage-sqlite
+      - name: Check lifecycle and checkpoint declarations
+        run: >-
+          pnpm exec tsc -b vendor/cordis/tsconfig.json
+          packages/session/session-projection-cache/tsconfig.json packages/storage/storage-sqlite/tsconfig.json --pretty false
 
   static:
     name: Host build and documentation
@@ -87,7 +93,13 @@ jobs:
       - name: Verify complete documentation gates
         run: pnpm run doc-sync
       - name: Lint changed lifecycle implementation and regressions
-        run: pnpm exec tsx scripts/run-oxlint.ts vendor/cordis/src/fiber.ts vendor/cordis/src/reflect.ts vendor/cordis/src/unloading.ts packages/extensions/tool-cordis/tests/cordis-lifecycle.spec.ts packages/boot/hmr/tests/modules.spec.ts
+        run: >-
+          pnpm exec tsx scripts/run-oxlint.ts
+          vendor/cordis/src/fiber.ts vendor/cordis/src/reflect.ts vendor/cordis/src/unloading.ts
+          packages/extensions/tool-cordis/tests/cordis-lifecycle.spec.ts packages/boot/hmr/tests/modules.spec.ts
+          packages/session/session-projection-cache/src/index.ts packages/session/session-projection-cache/tests/cache.spec.ts
+          packages/storage/storage-domain/src/index.ts packages/storage/storage-json/src/index.ts
+          packages/storage/storage-sqlite/src/index.ts packages/storage/storage-sqlite/tests/sqlite-backend.spec.ts
 
   coverage:
     name: Exhaustive Linux coverage

@@ -224,16 +224,12 @@ export function apply(ctx: Context, config: Config): Promise<void> {
 
   const fiber = ctx.inject(backendServices, (domainCtx) => {
     const facility = new DomainFacility(domainCtx, config)
-    domainCtx.effect(() => {
-      const unmount = domainCtx.storage.mount('domain', facility)
-      return async () => {
-        // Close leftovers before unmounting: draining writes still emit
-        // domain/changed, whose invariant resolves the facility through the hub.
-        await facility.closeAll()
-        unmount()
-      }
+    domainCtx.effect(function* () {
+      yield domainCtx.storage.mount('domain', facility)
+      yield () => facility.closeAll()
+      // Withdrawal waits for consumers before their domain handles close.
+      yield domainCtx.provide('storageDomain', facility)
     })
-    domainCtx.provide('storageDomain', facility)
   })
   return Promise.resolve(fiber).then(() => {})
 }

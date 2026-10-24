@@ -253,6 +253,51 @@ describe('sqlite backend specifics', () => {
     await backend.close()
   })
 
+  it('keeps units writable until an injected consumer finishes its final write', async () => {
+    const ctx = new Context()
+    const path = await freshDbPath()
+    const started = Promise.withResolvers<undefined>()
+    const finish = Promise.withResolvers<undefined>()
+    const written = Promise.withResolvers<undefined>()
+    try {
+      await ctx.plugin(Storage)
+      const provider = await ctx.plugin(StorageSqlite, { path })
+      await ctx.inject(['storage', storageBackendServiceKey('sqlite')], async (inner) => {
+        const kv = inner.storage.backend.get('sqlite').kv
+        if (kv === undefined) throw new Error('sqlite KV facet missing')
+        const unit = await kv.open(DESCRIPTOR)
+        inner.effect(() => async () => {
+          started.resolve(undefined)
+          await finish.promise
+          try {
+            await unit.putRecord('records', 'final', { durable: true })
+            written.resolve(undefined)
+          } catch (error) {
+            written.reject(error)
+          } finally {
+            await unit.close()
+          }
+        })
+      })
+      const disposal = provider.dispose()
+      await started.promise
+      // Settle ready provider teardown work while the consumer remains gated.
+      await new Promise<void>(resolve => setImmediate(resolve))
+      finish.resolve(undefined)
+      await Promise.all([written.promise, disposal])
+      const reopened = backendAt(path)
+      try {
+        const unit = await reopened.kv.open(DESCRIPTOR)
+        expect((await unit.loadAll()).tables['records']?.['final']).toEqual({ durable: true })
+      } finally {
+        await reopened.close()
+      }
+    } finally {
+      finish.resolve(undefined)
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('registers on the storage hub as backend sqlite and closes on dispose', async () => {
     const ctx = new Context()
     await ctx.plugin(Storage)
