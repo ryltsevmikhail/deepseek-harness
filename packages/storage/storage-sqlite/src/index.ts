@@ -157,12 +157,10 @@ export class SqliteStorageBackend implements StorageBackend {
  */
 export function apply(ctx: Context, config: Config) {
   const backend = new SqliteStorageBackend(config)
-  ctx.effect(() => {
-    const dispose = ctx.storage.backend.register('sqlite', backend)
-    return async () => {
-      dispose()
-      await backend.close()
-    }
+  ctx.effect(function* () {
+    const unregister = ctx.storage.backend.register('sqlite', backend)
+    yield () => backend.close()
+    yield unregister
+    yield ctx.provide(storageBackendServiceKey('sqlite'), backend)
   }, 'storage-sqlite.registerBackend')
-  ctx.provide(storageBackendServiceKey('sqlite'), backend)
 }

@@ -145,13 +145,17 @@ async function harness(options: HarnessOptions = {}) {
   // The cache opens its domain through the storage stack; the json backend
   // lands the per-record tree under this tmp root.
   await ctx.plugin(Storage)
-  await ctx.plugin({ name: storageJsonName, inject: storageJsonInject, apply: storageJsonApply, Config: storageJsonConfig }, { root })
-  await ctx.plugin({ name: storageDomainName, inject: storageDomainInject, apply: storageDomainApply, Config: storageDomainConfig }, { backend: 'json' })
+  const backendFiber = await ctx.plugin(
+    { name: storageJsonName, inject: storageJsonInject, apply: storageJsonApply, Config: storageJsonConfig }, { root },
+  )
+  const domainFiber = await ctx.plugin(
+    { name: storageDomainName, inject: storageDomainInject, apply: storageDomainApply, Config: storageDomainConfig }, { backend: 'json' },
+  )
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjectionRegistry)
   ctx.sessionProjections.register(marksUnit(options.stateVersion))
   const fiber = await ctx.plugin(SessionProjectionCache, options.config ?? { writeEveryEvents: 100, writeIntervalMs: 60_000 })
-  return { ctx, root, fiber, cache: ctx.sessionProjectionCache }
+  return { ctx, root, fiber, backendFiber, domainFiber, cache: ctx.sessionProjectionCache }
 }
 
 const mark = (session: Session, marks: string[]): SessionEvent =>
@@ -211,6 +215,350 @@ afterEach(async () => {
 })
 
 describe('SessionProjectionCache write policy', () => {
+  it('does not replace an accepted live checkpoint with an older cold observation', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('cold-cannot-downgrade-live')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    await created
+    await cache.write(session)
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const table = domain.table('sessions')
+    const put = table.put.bind(table)
+    const gate = Promise.withResolvers<undefined>()
+    vi.spyOn(table, 'put').mockImplementation(async (key, value) => { await gate.promise; await put(key, value) })
+    const oldMark = mark(session, ['old'])
+    const oldEnd = endTurn(session)
+    mark(session, ['newest'])
+    const newest = endTurn(session)
+    const completed = cache.write(session)
+    cache.coldSnapshot(session.header, SessionLogOffset(0), [oldMark, oldEnd])
+    gate.resolve(undefined)
+    await completed
+    expect((await storedRows(root, id))?.['cache-test/marks'])
+      .toEqual({ ver: 1, seq: newest.seq, val: { marks: ['newest'] } })
+  })
+
+
+  it('keeps accepted final cuts distinct when a session id is recreated with identical metadata', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('same-header-new-session')
+    let old!: Session
+    const created = whenWritten(ctx, id)
+    const owner = await ctx.plugin(Object.assign((inner: Context) => {
+      old = inner.sessions.create(id, { meta: { createdAt: 1 } })
+    }, { inject: ['sessions'] }))
+    await created
+    await cache.write(old)
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const table = domain.table('sessions')
+    const put = table.put.bind(table)
+    const gate = Promise.withResolvers<undefined>()
+    vi.spyOn(table, 'put').mockImplementation(async (key, value) => { await gate.promise; await put(key, value) })
+    const seen: string[][] = []
+    ctx.on('domain/changed', (change) => {
+      if (change.domain !== projectionCacheDomainSpec.name || change.key !== id || change.operation !== 'put') return
+      const marks = cache.cachedSnapshot(old.header)?.values['cache-test/marks']
+      if (marks !== undefined) seen.push([...marks.marks])
+    })
+    mark(old, ['old-active'])
+    const active = cache.write(old)
+    mark(old, ['old-final'])
+    const final = cache.write(old)
+    await owner.dispose()
+    const replacement = ctx.sessions.create(id, { meta: { createdAt: 1 } })
+    mark(replacement, ['new-lifecycle'])
+    const fresh = cache.write(replacement)
+    gate.resolve(undefined)
+    await Promise.all([active, final, fresh])
+    expect(seen).toContainEqual(['old-final'])
+    expect(seen.at(-1)).toEqual(['new-lifecycle'])
+    expect((await storedRows(root, id))?.['cache-test/marks']?.val).toEqual({ marks: ['new-lifecycle'] })
+  })
+
+  it('retains the requested detach cut after its projection unit unregisters', async () => {
+    const { ctx, root, cache } = await harness()
+    const unregister = ctx.sessionProjections.register(secondaryMarksUnit)
+    const id = SessionId('detach-before-unit-unregister')
+    let session!: Session
+    const created = whenWritten(ctx, id)
+    const owner = await ctx.plugin(Object.assign((inner: Context) => {
+      session = inner.sessions.create(id)
+    }, { inject: ['sessions'] }))
+    await created
+    await cache.write(session)
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const table = domain.table('sessions')
+    const put = table.put.bind(table)
+    const gate = Promise.withResolvers<undefined>()
+    vi.spyOn(table, 'put').mockImplementation(async (key, value) => { await gate.promise; await put(key, value) })
+    const detached = Promise.withResolvers<undefined>()
+    let writes = 0
+    ctx.on('domain/changed', (change) => {
+      if (change.domain === projectionCacheDomainSpec.name && change.key === id && change.operation === 'put') {
+        writes += 1
+        if (writes === 2) detached.resolve(undefined)
+      }
+    })
+    mark(session, ['active'])
+    const active = cache.write(session)
+    const cut = mark(session, ['final'])
+    try {
+      await owner.dispose()
+      unregister()
+    } finally {
+      gate.resolve(undefined)
+    }
+    await active
+    await detached.promise
+    expect((await storedRows(root, id))?.['cache-test/secondary-marks'])
+      .toEqual({ ver: 1, seq: cut.seq, val: { marks: ['final'] } })
+  })
+
+  it('observes a failed cold write-back batch once rather than once per read', async () => {
+    const { ctx, cache, fiber } = await harness()
+    const meta = headerOf(SessionId('failed-cold-burst'))
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const gate = Promise.withResolvers<undefined>()
+    vi.spyOn(domain.table('sessions'), 'put').mockImplementation(() => gate.promise)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    for (let i = 0; i < 100; i += 1) cache.coldSnapshot(meta, SessionLogOffset(0), [])
+    const disposing = fiber.dispose()
+    gate.reject(new Error('synthetic cold storage failure'))
+    await disposing
+    expect(warn.mock.calls.length).toBeGreaterThan(0)
+    expect(warn.mock.calls.length).toBeLessThanOrEqual(2)
+  })
+
+  it('bounds optional cold work per id even when caller headers change', async () => {
+    const { ctx, root, cache, fiber } = await harness()
+    const id = SessionId('changing-cold-identities')
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const table = domain.table('sessions')
+    const put = table.put.bind(table)
+    const gate = Promise.withResolvers<undefined>()
+    const calls = vi.spyOn(table, 'put').mockImplementation(async (key, value) => { await gate.promise; await put(key, value) })
+    for (let i = 0; i < 100; i += 1) cache.coldSnapshot(headerOf(id, i), SessionLogOffset(0), [])
+    gate.resolve(undefined)
+    await fiber.dispose()
+    expect(calls).toHaveBeenCalledTimes(2)
+    expect((await storedRecord(root, id))?.identity.createdAt).toBe(99)
+  })
+
+  it('rejects a retired session write when a replacement currently owns its id', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('retired-cannot-overwrite-replacement')
+    let old!: Session
+    const created = whenWritten(ctx, id)
+    const owner = await ctx.plugin(Object.assign((inner: Context) => {
+      old = inner.sessions.create(id, { meta: { createdAt: 1 } })
+    }, { inject: ['sessions'] }))
+    await created
+    await cache.write(old)
+    mark(old, ['retired'])
+    await owner.dispose()
+    await cache.write(old)
+    const fresh = ctx.sessions.create(id, { meta: { createdAt: 2 } })
+    mark(fresh, ['current'])
+    await cache.write(fresh)
+    await expect(cache.write(old)).rejects.toThrow('current')
+    expect((await storedRecord(root, id))?.identity.createdAt).toBe(2)
+    expect((await storedRows(root, id))?.['cache-test/marks']?.val).toEqual({ marks: ['current'] })
+  })
+
+  it('coalesces requested checkpoints while log durability is blocked', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('blocked-log')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    await created
+    await cache.write(session)
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const flush = ctx.sessions.flush.bind(ctx.sessions)
+    const calls = vi.spyOn(ctx.sessions, 'flush').mockImplementation(async (target) => {
+      await gate
+      return flush(target)
+    })
+    let writes = 0
+    ctx.on('domain/changed', (change) => {
+      if (change.domain === projectionCacheDomainSpec.name && change.key === id && change.operation === 'put') writes += 1
+    })
+    let last: SessionEvent | undefined
+    for (let i = 0; i < 100; i += 1) {
+      mark(session, [String(i)])
+      last = endTurn(session)
+    }
+    const completed = cache.write(session)
+    const blockedFlushes = calls.mock.calls.length
+    release()
+    await completed
+    expect(blockedFlushes).toBe(1)
+    expect(writes).toBeLessThanOrEqual(2)
+    expect((await storedRows(root, id))?.['cache-test/marks'])
+      .toEqual({ ver: 1, seq: last?.seq, val: { marks: ['99'] } })
+  })
+
+  it('keeps a pending explicit write unresolved until its covering record is durable', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('blocked-table')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    await created
+    await cache.write(session)
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const table = domain.table('sessions')
+    const put = table.put.bind(table)
+    const first = Promise.withResolvers<undefined>()
+    const latest = Promise.withResolvers<undefined>()
+    let count = 0
+    const calls = vi.spyOn(table, 'put').mockImplementation(async (key, value) => {
+      count += 1
+      await (count === 1 ? first.promise : latest.promise)
+      await put(key, value)
+    })
+    for (let i = 0; i < 100; i += 1) {
+      mark(session, [String(i)])
+      endTurn(session)
+    }
+    let settled = false
+    const completed = cache.write(session).then(() => { settled = true })
+    await vi.waitFor(() => { expect(calls.mock.calls.length).toBeGreaterThanOrEqual(1) })
+    const admitted = calls.mock.calls.length
+    let settledAfterFirst = true
+    try {
+      first.resolve(undefined)
+      await vi.waitFor(() => { expect(calls.mock.calls.length).toBeGreaterThanOrEqual(2) })
+      settledAfterFirst = settled
+    } finally {
+      first.resolve(undefined)
+      latest.resolve(undefined)
+      await completed
+    }
+    expect(admitted).toBe(1)
+    expect(settledAfterFirst).toBe(false)
+    expect(calls).toHaveBeenCalledTimes(2)
+    expect((await storedRows(root, id))?.['cache-test/marks']?.val).toEqual({ marks: ['99'] })
+  })
+
+  it('observes a failed background batch once rather than retaining one waiter per event', async () => {
+    const { ctx, cache } = await harness()
+    const id = SessionId('failed-burst')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    await created
+    await cache.write(session)
+    const gate = Promise.withResolvers<undefined>()
+    ctx.on('session/flush', () => gate.promise)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    for (let i = 0; i < 100; i += 1) endTurn(session)
+    const completed = cache.write(session).catch(() => {})
+    gate.reject(new Error('synthetic blocked flush failure'))
+    await completed
+    await vi.waitFor(() => { expect(warn.mock.calls.length).toBeGreaterThan(0) })
+    expect(warn.mock.calls.length).toBeLessThanOrEqual(2)
+  })
+
+  it('continues with the pending checkpoint after an earlier log barrier fails', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('failed-active')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    await created
+    await cache.write(session)
+    const flush = ctx.sessions.flush.bind(ctx.sessions)
+    const barrier = Promise.withResolvers<boolean>()
+    vi.spyOn(ctx.sessions, 'flush').mockImplementationOnce(() => barrier.promise)
+      .mockImplementation(target => flush(target))
+    mark(session, ['old'])
+    const failed = expect(cache.write(session)).rejects.toThrow('synthetic flush failure')
+    mark(session, ['latest'])
+    const pending = cache.write(session)
+    barrier.reject(new Error('synthetic flush failure'))
+    await failed
+    await pending
+    expect((await storedRows(root, id))?.['cache-test/marks']?.val).toEqual({ marks: ['latest'] })
+  })
+
+  for (const owner of ['cache', 'root', 'domain', 'backend'] as const) {
+    it(`drains accepted checkpoints at ${owner} disposal before closing the domain`, async () => {
+      const { ctx, root, cache, fiber, domainFiber, backendFiber } = await harness()
+      const owners = { cache: fiber, root: ctx.fiber, domain: domainFiber, backend: backendFiber }
+      const id = SessionId('dispose-pending')
+      const created = whenWritten(ctx, id)
+      const session = ctx.sessions.create(id)
+      await created
+      await cache.write(session)
+      const gate = Promise.withResolvers<undefined>()
+      ctx.on('session/flush', () => gate.promise)
+      mark(session, ['first'])
+      const active = cache.write(session)
+      mark(session, ['final'])
+      const final = cache.write(session)
+      const disposal = owners[owner].dispose()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      gate.resolve(undefined)
+      await Promise.all([active, final, disposal])
+      expect((await storedRows(root, id))?.['cache-test/marks']?.val).toEqual({ marks: ['final'] })
+      await expect(cache.write(session)).rejects.toThrow('closed')
+    })
+  }
+
+  it('preserves a captured checkpoint while later events arrive during its log flush', async () => {
+    const { ctx, root, cache } = await harness()
+    const id = SessionId('captured-cut')
+    const created = whenWritten(ctx, id)
+    const session = ctx.sessions.create(id)
+    await created
+    await cache.write(session)
+    const gate = Promise.withResolvers<undefined>()
+    const flush = ctx.sessions.flush.bind(ctx.sessions)
+    vi.spyOn(ctx.sessions, 'flush').mockImplementation(async (target) => { await gate.promise; return flush(target) })
+    const cut = mark(session, ['captured'])
+    const writing = cache.write(session)
+    mark(session, ['later'])
+    gate.resolve(undefined)
+    await writing
+    expect((await storedRows(root, id))?.['cache-test/marks'])
+      .toEqual({ ver: 1, seq: cut.seq, val: { marks: ['captured'] } })
+  })
+
+  it('bounds cold write-backs and detaches caller-owned input before returning', async () => {
+    const { ctx, root, cache } = await harness()
+    const meta = headerOf(SessionId('cold-backlog'))
+    const domain = ctx.storageDomain.get(projectionCacheDomainSpec.name)
+    if (domain === undefined) throw new Error('cache domain missing')
+    const table = domain.table('sessions')
+    const put = table.put.bind(table)
+    const gate = Promise.withResolvers<undefined>()
+    const calls = vi.spyOn(table, 'put').mockImplementation(async (key, value) => { await gate.promise; await put(key, value) })
+    const final = Promise.withResolvers<undefined>()
+    let writes = 0
+    ctx.on('domain/changed', (change) => {
+      if (change.domain === projectionCacheDomainSpec.name && change.key === meta.id && change.operation === 'put') {
+        writes += 1
+        if (writes === 2) final.resolve(undefined)
+      }
+    })
+    for (let i = 0; i < 100; i += 1) {
+      const marks = [String(i)]
+      cache.coldSnapshot(meta, SessionLogOffset(0), [{ type: 'cache-test/mark', seq: SessionSeq(0), time: 0, data: { marks } }])
+      marks[0] = 'changed by caller'
+    }
+    const admitted = calls.mock.calls.length
+    gate.resolve(undefined)
+    await final.promise
+    expect(admitted).toBe(1)
+    expect(calls).toHaveBeenCalledTimes(2)
+    expect((await storedRows(root, meta.id))?.['cache-test/marks']?.val).toEqual({ marks: ['99'] })
+  })
+
   it('writes a durable checkpoint at turn/end (mandatory point)', async () => {
     const { ctx, root } = await harness()
     // The interval cannot substitute for the mandatory turn/end trigger.
